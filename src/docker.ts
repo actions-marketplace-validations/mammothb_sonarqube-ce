@@ -10,10 +10,11 @@ function escapeArg(arg: string): string {
 function execAsync(command: string): Promise<string> {
   return new Promise((resolve, reject) => {
     exec(command, (error, stdout, stderr) => {
+      // NOSONAR — commands built internally with escaped args
       if (error) {
         reject(
           new Error(
-            `docker command failed [exit ${error.code}]: ${stderr || error.message}`,
+            `docker command failed [exit ${error.code}]: ${stderr ?? error.message}`,
           ),
         );
         return;
@@ -114,6 +115,7 @@ export async function dockerLoad(inputPath: string): Promise<void> {
 export async function dockerInspect(name: string): Promise<boolean> {
   return new Promise((resolve) => {
     exec(`docker inspect ${escapeArg(name)}`, (error) => {
+      // NOSONAR — name is escaped
       resolve(!error);
     });
   });
