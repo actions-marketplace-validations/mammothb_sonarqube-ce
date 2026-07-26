@@ -1,8 +1,9 @@
+import { writeFile as writeFile$1 } from 'node:fs/promises';
 import * as os from 'os';
-import os__default from 'os';
+import os__default, { EOL } from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
-import { promises } from 'fs';
+import { promises, constants as constants$5 } from 'fs';
 import 'path';
 import http from 'http';
 import https from 'https';
@@ -32,6 +33,7 @@ import require$$1$5 from 'node:dns';
 import require$$5$3 from 'string_decoder';
 import 'child_process';
 import 'timers';
+import { exec } from 'node:child_process';
 
 // We use any as a valid input type
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -3596,7 +3598,7 @@ function requireUtils () {
 	    return res;
 	}
 	utils.enumToMap = enumToMap;
-
+	
 	return utils;
 }
 
@@ -3876,7 +3878,7 @@ function requireConstants$3 () {
 		    'transfer-encoding': HEADER_STATE.TRANSFER_ENCODING,
 		    'upgrade': HEADER_STATE.UPGRADE,
 		};
-
+		
 	} (constants$3));
 	return constants$3;
 }
@@ -28142,7 +28144,7 @@ var MediaTypes;
     });
 };
 
-(undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
+var __awaiter = (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
         function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
@@ -28152,6 +28154,268 @@ var MediaTypes;
     });
 };
 const { access, appendFile, writeFile } = promises;
+const SUMMARY_ENV_VAR = 'GITHUB_STEP_SUMMARY';
+class Summary {
+    constructor() {
+        this._buffer = '';
+    }
+    /**
+     * Finds the summary file path from the environment, rejects if env var is not found or file does not exist
+     * Also checks r/w permissions.
+     *
+     * @returns step summary file path
+     */
+    filePath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this._filePath) {
+                return this._filePath;
+            }
+            const pathFromEnv = process.env[SUMMARY_ENV_VAR];
+            if (!pathFromEnv) {
+                throw new Error(`Unable to find environment variable for $${SUMMARY_ENV_VAR}. Check if your runtime environment supports job summaries.`);
+            }
+            try {
+                yield access(pathFromEnv, constants$5.R_OK | constants$5.W_OK);
+            }
+            catch (_a) {
+                throw new Error(`Unable to access summary file: '${pathFromEnv}'. Check if the file has correct read/write permissions.`);
+            }
+            this._filePath = pathFromEnv;
+            return this._filePath;
+        });
+    }
+    /**
+     * Wraps content in an HTML tag, adding any HTML attributes
+     *
+     * @param {string} tag HTML tag to wrap
+     * @param {string | null} content content within the tag
+     * @param {[attribute: string]: string} attrs key-value list of HTML attributes to add
+     *
+     * @returns {string} content wrapped in HTML element
+     */
+    wrap(tag, content, attrs = {}) {
+        const htmlAttrs = Object.entries(attrs)
+            .map(([key, value]) => ` ${key}="${value}"`)
+            .join('');
+        if (!content) {
+            return `<${tag}${htmlAttrs}>`;
+        }
+        return `<${tag}${htmlAttrs}>${content}</${tag}>`;
+    }
+    /**
+     * Writes text in the buffer to the summary buffer file and empties buffer. Will append by default.
+     *
+     * @param {SummaryWriteOptions} [options] (optional) options for write operation
+     *
+     * @returns {Promise<Summary>} summary instance
+     */
+    write(options) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const overwrite = !!(options === null || options === void 0 ? void 0 : options.overwrite);
+            const filePath = yield this.filePath();
+            const writeFunc = overwrite ? writeFile : appendFile;
+            yield writeFunc(filePath, this._buffer, { encoding: 'utf8' });
+            return this.emptyBuffer();
+        });
+    }
+    /**
+     * Clears the summary buffer and wipes the summary file
+     *
+     * @returns {Summary} summary instance
+     */
+    clear() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.emptyBuffer().write({ overwrite: true });
+        });
+    }
+    /**
+     * Returns the current summary buffer as a string
+     *
+     * @returns {string} string of summary buffer
+     */
+    stringify() {
+        return this._buffer;
+    }
+    /**
+     * If the summary buffer is empty
+     *
+     * @returns {boolen} true if the buffer is empty
+     */
+    isEmptyBuffer() {
+        return this._buffer.length === 0;
+    }
+    /**
+     * Resets the summary buffer without writing to summary file
+     *
+     * @returns {Summary} summary instance
+     */
+    emptyBuffer() {
+        this._buffer = '';
+        return this;
+    }
+    /**
+     * Adds raw text to the summary buffer
+     *
+     * @param {string} text content to add
+     * @param {boolean} [addEOL=false] (optional) append an EOL to the raw text (default: false)
+     *
+     * @returns {Summary} summary instance
+     */
+    addRaw(text, addEOL = false) {
+        this._buffer += text;
+        return addEOL ? this.addEOL() : this;
+    }
+    /**
+     * Adds the operating system-specific end-of-line marker to the buffer
+     *
+     * @returns {Summary} summary instance
+     */
+    addEOL() {
+        return this.addRaw(EOL);
+    }
+    /**
+     * Adds an HTML codeblock to the summary buffer
+     *
+     * @param {string} code content to render within fenced code block
+     * @param {string} lang (optional) language to syntax highlight code
+     *
+     * @returns {Summary} summary instance
+     */
+    addCodeBlock(code, lang) {
+        const attrs = Object.assign({}, (lang && { lang }));
+        const element = this.wrap('pre', this.wrap('code', code), attrs);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML list to the summary buffer
+     *
+     * @param {string[]} items list of items to render
+     * @param {boolean} [ordered=false] (optional) if the rendered list should be ordered or not (default: false)
+     *
+     * @returns {Summary} summary instance
+     */
+    addList(items, ordered = false) {
+        const tag = ordered ? 'ol' : 'ul';
+        const listItems = items.map(item => this.wrap('li', item)).join('');
+        const element = this.wrap(tag, listItems);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML table to the summary buffer
+     *
+     * @param {SummaryTableCell[]} rows table rows
+     *
+     * @returns {Summary} summary instance
+     */
+    addTable(rows) {
+        const tableBody = rows
+            .map(row => {
+            const cells = row
+                .map(cell => {
+                if (typeof cell === 'string') {
+                    return this.wrap('td', cell);
+                }
+                const { header, data, colspan, rowspan } = cell;
+                const tag = header ? 'th' : 'td';
+                const attrs = Object.assign(Object.assign({}, (colspan && { colspan })), (rowspan && { rowspan }));
+                return this.wrap(tag, data, attrs);
+            })
+                .join('');
+            return this.wrap('tr', cells);
+        })
+            .join('');
+        const element = this.wrap('table', tableBody);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds a collapsable HTML details element to the summary buffer
+     *
+     * @param {string} label text for the closed state
+     * @param {string} content collapsable content
+     *
+     * @returns {Summary} summary instance
+     */
+    addDetails(label, content) {
+        const element = this.wrap('details', this.wrap('summary', label) + content);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML image tag to the summary buffer
+     *
+     * @param {string} src path to the image you to embed
+     * @param {string} alt text description of the image
+     * @param {SummaryImageOptions} options (optional) addition image attributes
+     *
+     * @returns {Summary} summary instance
+     */
+    addImage(src, alt, options) {
+        const { width, height } = options || {};
+        const attrs = Object.assign(Object.assign({}, (width && { width })), (height && { height }));
+        const element = this.wrap('img', null, Object.assign({ src, alt }, attrs));
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML section heading element
+     *
+     * @param {string} text heading text
+     * @param {number | string} [level=1] (optional) the heading level, default: 1
+     *
+     * @returns {Summary} summary instance
+     */
+    addHeading(text, level) {
+        const tag = `h${level}`;
+        const allowedTag = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)
+            ? tag
+            : 'h1';
+        const element = this.wrap(allowedTag, text);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML thematic break (<hr>) to the summary buffer
+     *
+     * @returns {Summary} summary instance
+     */
+    addSeparator() {
+        const element = this.wrap('hr', null);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML line break (<br>) to the summary buffer
+     *
+     * @returns {Summary} summary instance
+     */
+    addBreak() {
+        const element = this.wrap('br', null);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML blockquote to the summary buffer
+     *
+     * @param {string} text quote text
+     * @param {string} cite (optional) citation url
+     *
+     * @returns {Summary} summary instance
+     */
+    addQuote(text, cite) {
+        const attrs = Object.assign({}, (cite && { cite }));
+        const element = this.wrap('blockquote', text, attrs);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML anchor tag to the summary buffer
+     *
+     * @param {string} text link text/content
+     * @param {string} href hyperlink
+     *
+     * @returns {Summary} summary instance
+     */
+    addLink(text, href) {
+        const element = this.wrap('a', text, { href });
+        return this.addRaw(element).addEOL();
+    }
+}
+const _summary = new Summary();
+const summary = _summary;
 
 (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -28275,13 +28539,6 @@ function setFailed(message) {
     error(message);
 }
 /**
- * Writes debug message to user log
- * @param message debug message
- */
-function debug(message) {
-    issueCommand('debug', {}, message);
-}
-/**
  * Adds an error issue
  * @param message error issue message. Errors will be converted to string via toString()
  * @param properties optional properties to add to the annotation.
@@ -28289,44 +28546,672 @@ function debug(message) {
 function error(message, properties = {}) {
     issueCommand('error', toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
-
 /**
- * Waits for a number of milliseconds.
- *
- * @param milliseconds The number of milliseconds to wait.
- * @returns Resolves with 'done!' after the wait is over.
+ * Writes info to log with console.log.
+ * @param message info message
  */
-async function wait(milliseconds) {
-    return new Promise((resolve) => {
-        if (Number.isNaN(milliseconds)) {
-            throw new Error("milliseconds is not a number");
-        }
-        setTimeout(() => resolve("done!"), milliseconds);
+function info(message) {
+    process.stdout.write(message + os.EOL);
+}
+
+/** Shell-escape a single argument by wrapping in single quotes. */
+function escapeArg(arg) {
+    return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+/** Promisified child_process.exec */
+function execAsync(command) {
+    return new Promise((resolve, reject) => {
+        exec(command, (error, stdout, stderr) => {
+            if (error) {
+                reject(new Error(`docker command failed [exit ${error.code}]: ${stderr || error.message}`));
+                return;
+            }
+            resolve(stdout.trim());
+        });
     });
+}
+/** Pull a Docker image */
+async function dockerPull(image) {
+    await execAsync(`docker pull ${escapeArg(image)}`);
+}
+/**
+ * Run a Docker container (detached). Returns the container ID.
+ * Supports name, port, network, rm, env, and volume options.
+ */
+async function dockerRun(opts) {
+    const parts = ["docker", "run", "-d"];
+    if (opts.name) {
+        parts.push("--name", escapeArg(opts.name));
+    }
+    if (opts.port) {
+        parts.push("-p", escapeArg(opts.port));
+    }
+    if (opts.network) {
+        parts.push("--network", escapeArg(opts.network));
+    }
+    if (opts.rm) {
+        parts.push("--rm");
+    }
+    if (opts.env) {
+        for (const [key, value] of Object.entries(opts.env)) {
+            parts.push("-e", escapeArg(`${key}=${value}`));
+        }
+    }
+    if (opts.volume) {
+        parts.push("-v", escapeArg(opts.volume));
+    }
+    parts.push(escapeArg(opts.image));
+    return await execAsync(parts.join(" "));
+}
+/** Stop a running container */
+async function dockerStop(name) {
+    await execAsync(`docker stop ${escapeArg(name)}`);
+}
+/** Remove a stopped container */
+async function dockerRm(name) {
+    await execAsync(`docker rm ${escapeArg(name)}`);
+}
+/** Create a Docker bridge network */
+async function dockerNetworkCreate(name) {
+    await execAsync(`docker network create ${escapeArg(name)}`);
+}
+/** Remove a Docker network */
+async function dockerNetworkRm(name) {
+    await execAsync(`docker network rm ${escapeArg(name)}`);
+}
+/** Execute a command in a running container. Returns stdout. */
+async function dockerExec(container, cmd) {
+    const escaped = cmd.map(escapeArg).join(" ");
+    return await execAsync(`docker exec ${escapeArg(container)} ${escaped}`);
+}
+
+/** Read + validate all action inputs. Returns typed ActionInputs or throws. */
+function parseInputs() {
+    // ── Read raw strings (defaults come from action.yml) ────────────────
+    const sonarProjectName = getInput("sonar-project-name");
+    const sonarProjectKey = getInput("sonar-project-key");
+    const sonarSourcePath = getInput("sonar-source-path");
+    const sonarMetricsPath = getInput("sonar-metrics-path");
+    const sonarInstancePort = getInput("sonar-instance-port");
+    const sonarServerImage = getInput("sonar-server-image");
+    const sonarScannerImage = getInput("sonar-scanner-image");
+    const sonarOptions = getInput("sonar-options");
+    const preScanScript = getInput("pre-scan-script");
+    const generatePrCommentRaw = getInput("generate-pr-comment");
+    const newCodeNDays = getInput("new-code-n-days");
+    const reportsScopesRaw = getInput("reports-scopes");
+    const reportsRetentionDaysRaw = getInput("reports-retention-days");
+    // ── Validate port ───────────────────────────────────────────────────
+    if (!/^\d+$/.test(sonarInstancePort)) {
+        throw new Error(`sonar-instance-port must be a numeric string, got: "${sonarInstancePort}"`);
+    }
+    const portNum = parseInt(sonarInstancePort, 10);
+    if (portNum < 1024 || portNum > 65535) {
+        throw new Error(`sonar-instance-port must be between 1024–65535, got: ${portNum}`);
+    }
+    // ── Validate server image (Community Edition only) ───────────────────
+    if (!sonarServerImage.includes("community")) {
+        throw new Error(`sonar-server-image must be a Community Edition image (must contain "community"), got: "${sonarServerImage}"`);
+    }
+    // ── Parse reports scopes ───────────────────────────────────────────
+    let reportsScopes;
+    try {
+        const parsed = JSON.parse(reportsScopesRaw);
+        if (!Array.isArray(parsed)) {
+            throw new Error("not an array");
+        }
+        for (const item of parsed) {
+            if (item !== "overall" && item !== "new") {
+                throw new Error(`invalid scope: "${String(item)}"`);
+            }
+        }
+        reportsScopes = parsed;
+    }
+    catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(`reports-scopes must be a JSON array of "overall" / "new", got: "${reportsScopesRaw}" (${reason})`);
+    }
+    // ── Validate retention days ────────────────────────────────────────
+    if (!/^\d+$/.test(reportsRetentionDaysRaw)) {
+        throw new Error(`reports-retention-days must be a non-negative integer, got: "${reportsRetentionDaysRaw}"`);
+    }
+    const reportsRetentionDays = parseInt(reportsRetentionDaysRaw, 10);
+    // ── Coerce boolean ─────────────────────────────────────────────────
+    const generatePrComment = generatePrCommentRaw === "true";
+    return {
+        sonarProjectName,
+        sonarProjectKey,
+        sonarSourcePath,
+        sonarMetricsPath,
+        sonarInstancePort,
+        sonarServerImage,
+        sonarScannerImage,
+        sonarOptions,
+        preScanScript,
+        generatePrComment,
+        newCodeNDays,
+        reportsScopes,
+        reportsRetentionDays,
+    };
+}
+
+/** Base64-encode credentials for Basic Auth header */
+function basicAuth(user, pass) {
+    return `Basic ${Buffer.from(`${user}:${pass}`).toString("base64")}`;
+}
+class SonarQube {
+    baseUrl;
+    auth;
+    constructor(baseUrl, auth) {
+        this.baseUrl = baseUrl.replace(/\/$/, "");
+        this.auth = auth;
+    }
+    /** Update credentials (used after password change) */
+    setAuth(auth) {
+        this.auth = auth;
+    }
+    // ── System ────────────────────────────────────────────────────────
+    /** GET /api/system/status */
+    async systemStatus() {
+        const resp = await fetch(`${this.baseUrl}/api/system/status`, {
+            headers: { Authorization: basicAuth(this.auth.user, this.auth.pass) },
+        });
+        if (!resp.ok) {
+            throw new Error(`system/status failed [${resp.status}]: ${await resp.text()}`);
+        }
+        return (await resp.json());
+    }
+    /** POST /api/users/change_password */
+    async changePassword(newPassword) {
+        const resp = await fetch(`${this.baseUrl}/api/users/change_password`, {
+            method: "POST",
+            headers: {
+                Authorization: basicAuth(this.auth.user, this.auth.pass),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+                login: this.auth.user,
+                previousPassword: this.auth.pass,
+                password: newPassword,
+            }).toString(),
+        });
+        if (!resp.ok) {
+            throw new Error(`change_password failed [${resp.status}]: ${await resp.text()}`);
+        }
+    }
+    // ── Projects ────────────────────────────────────────────────────
+    /** POST /api/projects/create */
+    async createProject(name) {
+        const resp = await fetch(`${this.baseUrl}/api/projects/create`, {
+            method: "POST",
+            headers: {
+                Authorization: basicAuth(this.auth.user, this.auth.pass),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({ name, project: name }).toString(),
+        });
+        if (!resp.ok) {
+            throw new Error(`projects/create failed [${resp.status}]: ${await resp.text()}`);
+        }
+    }
+    /** POST /api/projects/update_visibility (public so homepage works) */
+    async setHomepage(project) {
+        const resp = await fetch(`${this.baseUrl}/api/projects/update_visibility`, {
+            method: "POST",
+            headers: {
+                Authorization: basicAuth(this.auth.user, this.auth.pass),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+                project,
+                visibility: "public",
+            }).toString(),
+        });
+        if (!resp.ok) {
+            throw new Error(`projects/update_visibility failed [${resp.status}]: ${await resp.text()}`);
+        }
+    }
+    // ── Tokens ───────────────────────────────────────────────────────
+    /** POST /api/user_tokens/generate — returns the token string */
+    async generateToken(name) {
+        const resp = await fetch(`${this.baseUrl}/api/user_tokens/generate`, {
+            method: "POST",
+            headers: {
+                Authorization: basicAuth(this.auth.user, this.auth.pass),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({ name }).toString(),
+        });
+        if (!resp.ok) {
+            throw new Error(`user_tokens/generate failed [${resp.status}]: ${await resp.text()}`);
+        }
+        const data = (await resp.json());
+        return data.token;
+    }
+    // ── Quality Gates ───────────────────────────────────────────────
+    /** GET /api/qualitygates/project_status?projectKey=… */
+    async projectStatus(projectKey) {
+        const url = `${this.baseUrl}/api/qualitygates/project_status?projectKey=${encodeURIComponent(projectKey)}`;
+        const resp = await fetch(url, {
+            headers: { Authorization: basicAuth(this.auth.user, this.auth.pass) },
+        });
+        if (!resp.ok) {
+            throw new Error(`qualitygates/project_status failed [${resp.status}]: ${await resp.text()}`);
+        }
+        return (await resp.json());
+    }
+    /** Poll projectStatus until status != "NONE", or throw after timeoutSec */
+    async waitForQualityGate(projectKey, timeoutSec) {
+        const deadline = Date.now() + timeoutSec * 1000;
+        while (Date.now() < deadline) {
+            const { projectStatus } = await this.projectStatus(projectKey);
+            if (projectStatus.status !== "NONE") {
+                return;
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+        }
+        throw new Error(`Quality gate status still NONE after ${timeoutSec}s`);
+    }
+    // ── Metrics ─────────────────────────────────────────────────────
+    /** GET /api/measures/component?component=…&metricKeys=… */
+    async measures(component, metricKeys) {
+        const params = new URLSearchParams({
+            component,
+            metricKeys: metricKeys.join(","),
+        });
+        const url = `${this.baseUrl}/api/measures/component?${params.toString()}`;
+        const resp = await fetch(url, {
+            headers: { Authorization: basicAuth(this.auth.user, this.auth.pass) },
+        });
+        if (!resp.ok) {
+            throw new Error(`measures/component failed [${resp.status}]: ${await resp.text()}`);
+        }
+        return (await resp.json());
+    }
+    // ── Issues ──────────────────────────────────────────────────────
+    /** GET /api/issues/search?componentKeys=…&p=…&ps=… */
+    async searchIssues(componentKeys, opts) {
+        const params = new URLSearchParams({
+            componentKeys,
+            ps: String(opts?.pageSize ?? 500),
+            p: String(opts?.page ?? 1),
+        });
+        if (opts?.createdInLast) {
+            params.set("createdInLast", opts.createdInLast);
+        }
+        const url = `${this.baseUrl}/api/issues/search?${params.toString()}`;
+        const resp = await fetch(url, {
+            headers: { Authorization: basicAuth(this.auth.user, this.auth.pass) },
+        });
+        if (!resp.ok) {
+            throw new Error(`issues/search failed [${resp.status}]: ${await resp.text()}`);
+        }
+        return (await resp.json());
+    }
+    /** Fetch all issues across pages (pagesize=500) */
+    async fetchAllIssues(componentKeys, opts) {
+        const all = [];
+        const pageSize = 500;
+        let page = 1;
+        let total = 0;
+        do {
+            const result = await this.searchIssues(componentKeys, {
+                ...opts,
+                page,
+                pageSize,
+            });
+            all.push(...result.issues);
+            total = result.paging.total;
+            page++;
+        } while (all.length < total);
+        return all;
+    }
+    // ── Hotspots ────────────────────────────────────────────────────
+    /** GET /api/hotspots/search?projectKey=…&p=…&ps=… */
+    async searchHotspots(projectKey, opts) {
+        const params = new URLSearchParams({
+            projectKey,
+            ps: String(opts?.pageSize ?? 500),
+            p: String(opts?.page ?? 1),
+        });
+        const url = `${this.baseUrl}/api/hotspots/search?${params.toString()}`;
+        const resp = await fetch(url, {
+            headers: { Authorization: basicAuth(this.auth.user, this.auth.pass) },
+        });
+        if (!resp.ok) {
+            throw new Error(`hotspots/search failed [${resp.status}]: ${await resp.text()}`);
+        }
+        return (await resp.json());
+    }
+    /** Fetch all hotspots across pages (pagesize=500) */
+    async fetchAllHotspots(projectKey) {
+        const all = [];
+        const pageSize = 500;
+        let page = 1;
+        let total = 0;
+        do {
+            const result = await this.searchHotspots(projectKey, { page, pageSize });
+            all.push(...result.hotspots);
+            total = result.paging.total;
+            page++;
+        } while (all.length < total);
+        return all;
+    }
+    // ── Reindex ─────────────────────────────────────────────────────
+    /** POST /api/issues/reindex?project=… (triggers async reindex) */
+    async reindexIssues(project) {
+        const url = `${this.baseUrl}/api/issues/reindex?project=${encodeURIComponent(project)}`;
+        const resp = await fetch(url, {
+            method: "POST",
+            headers: { Authorization: basicAuth(this.auth.user, this.auth.pass) },
+        });
+        if (!resp.ok) {
+            throw new Error(`issues/reindex failed [${resp.status}]: ${await resp.text()}`);
+        }
+    }
+    /**
+     * Poll docker exec grep on ce.log until ISSUE_SYNC SUCCESS,
+     * or throw after timeoutSec.
+     */
+    async waitForReindex(containerName, timeoutSec) {
+        const deadline = Date.now() + timeoutSec * 1000;
+        while (Date.now() < deadline) {
+            try {
+                await dockerExec(containerName, [
+                    "grep",
+                    "-q",
+                    "ISSUE_SYNC.*SUCCESS",
+                    "/opt/sonarqube/logs/ce.log",
+                ]);
+                return; // grep -q succeeded (exit 0 = match found)
+            }
+            catch {
+                // Match not found yet — retry
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+        }
+        throw new Error(`Reindex did not complete within ${timeoutSec}s`);
+    }
+    // ── Wait helpers ───────────────────────────────────────────────────
+    /** Poll /api/system/status until UP, or throw after timeoutSec seconds */
+    async waitForUp(timeoutSec) {
+        const deadline = Date.now() + timeoutSec * 1000;
+        while (Date.now() < deadline) {
+            try {
+                const { status } = await this.systemStatus();
+                if (status === "UP") {
+                    return;
+                }
+            }
+            catch {
+                // Server not reachable yet — retry
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+        }
+        throw new Error(`SonarQube did not reach UP status within ${timeoutSec}s`);
+    }
 }
 
 /**
- * The main function for the action.
- *
- * @returns Resolves when the action is complete.
+ * Convert a SonarQube rating (1 = best, 5 = worst) to star display.
+ * 1 → ★★★★★, 5 → ★☆☆☆☆
  */
+function generateStars(rating) {
+    const rounded = Math.round(rating);
+    return "★".repeat(6 - rounded) + "☆".repeat(rounded - 1);
+}
+/** Build a lookup from metric key to value */
+function metricMap(metrics) {
+    const map = {};
+    for (const m of metrics.component.measures) {
+        map[m.metric] = m.value;
+    }
+    return map;
+}
+/** Format a number value (round to 1 decimal if float) */
+function fmt(val) {
+    const n = Number(val);
+    if (Number.isNaN(n)) {
+        return val;
+    }
+    return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+/** Format a rating value to stars, or "-" if missing */
+function ratingStars(m, key) {
+    const val = m[key];
+    if (val === undefined || val === "") {
+        return "-";
+    }
+    return generateStars(Number(val));
+}
+/**
+ * Build the full analysis summary markdown string.
+ * Includes quality gate banner, new-code stats, overall metrics,
+ * collapsible issues/hotspots, and artifact download links.
+ */
+function generateAnalysisSummary(params) {
+    const { metrics, newIssues, newHotspots, newArtifactUrl, overallArtifactUrl, } = params;
+    const m = metricMap(metrics);
+    const lines = [];
+    // ── Quality gate banner ───────────────────────────────────────────
+    const qgStatus = m.alert_status ?? "NONE";
+    if (qgStatus === "OK") {
+        lines.push("## ✅ Quality Gate Passed", "", "All quality gate conditions are met.", "");
+    }
+    else if (qgStatus === "ERROR") {
+        lines.push("## ❌ Quality Gate Failed", "", "One or more quality gate conditions failed.", "");
+    }
+    else {
+        lines.push("## ⏳ Quality Gate — No Data", "", "No quality gate has been computed for this project yet.", "");
+    }
+    // ── New-code stats ───────────────────────────────────────────────
+    if (newIssues.length > 0 || newHotspots.length > 0) {
+        lines.push("### New Code", "");
+        lines.push("| Metric | Value |", "|--------|-------|");
+        if (newIssues.length > 0) {
+            lines.push(`| New Issues | ${newIssues.length} |`);
+        }
+        if (newHotspots.length > 0) {
+            lines.push(`| New Hotspots | ${newHotspots.length} |`);
+        }
+        lines.push("");
+    }
+    // ── Overall metrics ──────────────────────────────────────────────
+    lines.push("### Overall Metrics", "");
+    lines.push("| Metric | Value | Rating |", "|--------|-------|--------|");
+    const metricsTable = [
+        {
+            label: "Bugs",
+            value: fmt(m.bugs ?? "0"),
+            stars: ratingStars(m, "reliability_rating"),
+        },
+        {
+            label: "Vulnerabilities",
+            value: fmt(m.vulnerabilities ?? "0"),
+            stars: ratingStars(m, "security_rating"),
+        },
+        {
+            label: "Code Smells",
+            value: fmt(m.code_smells ?? "0"),
+            stars: ratingStars(m, "sqale_rating"),
+        },
+        {
+            label: "Coverage",
+            value: m.coverage ? `${fmt(m.coverage)}%` : "-",
+            stars: "-",
+        },
+        {
+            label: "Duplications",
+            value: m.duplicated_lines_density
+                ? `${fmt(m.duplicated_lines_density)}%`
+                : "-",
+            stars: "-",
+        },
+        { label: "Lines of Code", value: fmt(m.ncloc ?? "0"), stars: "-" },
+    ];
+    for (const row of metricsTable) {
+        if (row.value !== "-" || row.stars !== "-") {
+            lines.push(`| ${row.label} | ${row.value} | ${row.stars} |`);
+        }
+    }
+    lines.push("");
+    // ── Artifact links ───────────────────────────────────────────────
+    if (newArtifactUrl || overallArtifactUrl) {
+        lines.push("### Downloads", "");
+        if (newArtifactUrl) {
+            lines.push(`- [New Code Report](${newArtifactUrl})`);
+        }
+        if (overallArtifactUrl) {
+            lines.push(`- [Overall Report](${overallArtifactUrl})`);
+        }
+        lines.push("");
+    }
+    // ── Collapsible new issues ───────────────────────────────────────
+    if (newIssues.length > 0) {
+        lines.push("<details>");
+        lines.push(`<summary><b>New Issues (${newIssues.length})</b></summary>`);
+        lines.push("");
+        lines.push("| Severity | Type | File | Message |");
+        lines.push("|----------|------|------|---------|");
+        for (const issue of newIssues) {
+            const file = issue.component.includes(":")
+                ? issue.component.slice(issue.component.indexOf(":") + 1)
+                : issue.component;
+            lines.push(`| ${issue.severity} | ${issue.type} | ${file} | ${issue.message} |`);
+        }
+        lines.push("");
+        lines.push("</details>");
+        lines.push("");
+    }
+    // ── Collapsible new hotspots ─────────────────────────────────────
+    if (newHotspots.length > 0) {
+        lines.push("<details>");
+        lines.push(`<summary><b>New Security Hotspots (${newHotspots.length})</b></summary>`);
+        lines.push("");
+        lines.push("| Probability | Category | File | Message |");
+        lines.push("|-------------|----------|------|---------|");
+        for (const h of newHotspots) {
+            const file = h.component.includes(":")
+                ? h.component.slice(h.component.indexOf(":") + 1)
+                : h.component;
+            lines.push(`| ${h.vulnerabilityProbability} | ${h.securityCategory} | ${file} | ${h.message} |`);
+        }
+        lines.push("");
+        lines.push("</details>");
+        lines.push("");
+    }
+    return lines.join("\n");
+}
+
 async function run() {
+    const networkName = "sq-network";
+    const containerName = "sonar-server";
+    const tokenName = `scan-${Date.now()}`;
     try {
-        const ms = getInput("milliseconds");
-        // Debug logs are only output if the `ACTIONS_STEP_DEBUG` secret is true
-        debug(`Waiting ${ms} milliseconds ...`);
-        // Log the current timestamp, wait, then log the new timestamp
-        debug(new Date().toTimeString());
-        await wait(parseInt(ms, 10));
-        debug(new Date().toTimeString());
-        // Set outputs for other workflow steps to use
-        setOutput("time", new Date().toTimeString());
+        const inputs = parseInputs();
+        // ── Docker setup ──────────────────────────────────────────────
+        info(`Pulling ${inputs.sonarServerImage} …`);
+        await dockerPull(inputs.sonarServerImage);
+        info(`Pulling ${inputs.sonarScannerImage} …`);
+        await dockerPull(inputs.sonarScannerImage);
+        info(`Creating network ${networkName} …`);
+        await dockerNetworkCreate(networkName);
+        info(`Starting SonarQube on port ${inputs.sonarInstancePort} …`);
+        await dockerRun({
+            image: inputs.sonarServerImage,
+            name: containerName,
+            port: `${inputs.sonarInstancePort}:9000`,
+            network: networkName,
+        });
+        // ── SonarQube bootstrap ───────────────────────────────────────
+        const baseUrl = `http://localhost:${inputs.sonarInstancePort}`;
+        const sq = new SonarQube(baseUrl, { user: "admin", pass: "admin" });
+        info("Waiting for SonarQube to boot (timeout: 180s) …");
+        await sq.waitForUp(180);
+        info("SonarQube is UP.");
+        info("Changing default password …");
+        const newPassword = "Son@rless123";
+        await sq.changePassword(newPassword);
+        sq.setAuth({ user: "admin", pass: newPassword });
+        // ── Project + Token ───────────────────────────────────────────
+        info(`Creating project "${inputs.sonarProjectName}" …`);
+        await sq.createProject(inputs.sonarProjectName);
+        await sq.setHomepage(inputs.sonarProjectName);
+        info("Generating user token …");
+        const token = await sq.generateToken(tokenName);
+        info(`Token: ${token.slice(0, 8)}…`);
+        // ── Scanner ───────────────────────────────────────────────────
+        const workspace = process.env.GITHUB_WORKSPACE ?? ".";
+        info("Running scanner …");
+        await dockerRun({
+            image: inputs.sonarScannerImage,
+            rm: true,
+            network: networkName,
+            env: {
+                SONAR_HOST_URL: `http://${containerName}:9000`,
+                SONAR_TOKEN: token,
+                SONAR_SCANNER_OPTS: [
+                    `-Dsonar.projectKey=${inputs.sonarProjectName}`,
+                    `-Dsonar.sources=${inputs.sonarSourcePath}`,
+                    inputs.sonarOptions,
+                ]
+                    .filter(Boolean)
+                    .join(" "),
+            },
+            volume: `${workspace}:/usr/src`,
+        });
+        info("Scanner finished.");
+        // ── Quality gate ──────────────────────────────────────────────
+        info("Waiting for quality gate (timeout: 120s) …");
+        await sq.waitForQualityGate(inputs.sonarProjectName, 120);
+        const qg = await sq.projectStatus(inputs.sonarProjectName);
+        info(`Quality gate: ${qg.projectStatus.status}`);
+        // ── Metrics ───────────────────────────────────────────────────
+        const metricKeys = [
+            "bugs",
+            "vulnerabilities",
+            "code_smells",
+            "quality_gate_details",
+            "violations",
+            "duplicated_lines_density",
+            "ncloc",
+            "coverage",
+            "reliability_rating",
+            "security_rating",
+            "security_review_rating",
+            "sqale_rating",
+            "security_hotspots",
+            "open_issues",
+            "alert_status",
+        ];
+        info("Fetching metrics …");
+        const metrics = await sq.measures(inputs.sonarProjectName, metricKeys);
+        await writeFile$1(inputs.sonarMetricsPath, JSON.stringify(metrics, null, 2));
+        info(`Metrics written to ${inputs.sonarMetricsPath}`);
+        // ── Step summary ──────────────────────────────────────────────
+        const summary$1 = generateAnalysisSummary({
+            metrics,
+            newIssues: [],
+            newHotspots: [],
+        });
+        summary.addRaw(summary$1);
+        await summary.write();
+        setOutput("analysis-summary", summary$1);
+        info("Step summary written.");
     }
     catch (error) {
-        // Fail the workflow run if an error occurs
         if (error instanceof Error) {
             setFailed(error.message);
         }
+    }
+    finally {
+        // ── Cleanup ───────────────────────────────────────────────────
+        info(`Stopping ${containerName} …`);
+        await dockerStop(containerName).catch(() => { });
+        await dockerRm(containerName).catch(() => { });
+        info(`Removing network ${networkName} …`);
+        await dockerNetworkRm(networkName).catch(() => { });
+        info("Cleanup complete.");
     }
 }
 

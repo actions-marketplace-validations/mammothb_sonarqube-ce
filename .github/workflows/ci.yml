@@ -35,17 +35,10 @@ jobs:
         id: npm-test
         run: npm test
   test-action:
-    name: GitHub Actions Test
+    name: E2E — SonarQube Scan
     runs-on: ubuntu-latest
     steps:
       - *checkout
-      - name: Test Local Action
+      - name: Run Action
         id: test-action
         uses: ./
-        with:
-          milliseconds: 2000
-      - name: Print Output
-        id: output
-        run: echo "${TIME}"
-        env:
-          TIME: ${{ steps.test-action.outputs.time }}
