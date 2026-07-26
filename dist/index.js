@@ -162318,6 +162318,7 @@ function parseInputs() {
     const sonarScannerImage = getInput("sonar-scanner-image");
     const sonarOptions = getInput("sonar-options");
     const preScanScript = getInput("pre-scan-script");
+    const githubToken = getInput("github-token") || process.env.GITHUB_TOKEN || "";
     const generatePrCommentRaw = getInput("generate-pr-comment");
     const newCodeNDays = getInput("new-code-n-days");
     const reportsScopesRaw = getInput("reports-scopes");
@@ -162358,6 +162359,7 @@ function parseInputs() {
         sonarScannerImage,
         sonarOptions,
         preScanScript,
+        githubToken,
         generatePrComment,
         newCodeNDays,
         reportsScopes,
@@ -162368,6 +162370,7 @@ function parseInputs() {
 /** Escape markdown table-breaking characters in a string */
 function escapeMd$1(value) {
     return value
+        .replace(/\\/g, "\\\\")
         .replace(/\|/g, "\\|")
         .replace(/\*/g, "\\*")
         .replace(/_/g, "\\_")
@@ -162741,7 +162744,10 @@ class SonarQube {
 
 /** Escape markdown table-breaking characters */
 function escapeMd(value) {
-    return value.replace(/\|/g, "\\|").replace(/`/g, "\\`");
+    return value
+        .replace(/\\/g, "\\\\")
+        .replace(/\|/g, "\\|")
+        .replace(/`/g, "\\`");
 }
 /**
  * Convert a SonarQube rating (1 = best, 5 = worst) to star display.
@@ -163024,12 +163030,15 @@ async function generateReports(sq, inputs, projectKey, containerName) {
     }
     return result;
 }
-async function postPrComment(summary) {
+async function postPrComment(summary, token) {
     if (context.eventName !== "pull_request") {
         return;
     }
+    if (!token) {
+        throw new Error("GITHUB_TOKEN is not set. Pass it via with.github-token or env.GITHUB_TOKEN. " +
+            "See https://github.com/mammothb/sonarqube-ce#pr-comments");
+    }
     info("Posting PR comment …");
-    const token = process.env.GITHUB_TOKEN ?? "";
     const octokit = getOctokit(token);
     const header = "## SonarQube Analysis Summary";
     const body = `${header}\n\n${summary}`;
@@ -163170,7 +163179,7 @@ async function run() {
         info("Step summary written.");
         // ── PR comment ───────────────────────────────────────────────
         if (inputs.generatePrComment) {
-            await postPrComment(summary$1);
+            await postPrComment(summary$1, inputs.githubToken);
         }
         // ── Cache save (only if cache miss) ────────────────────────────
         if (!cacheHit) {
