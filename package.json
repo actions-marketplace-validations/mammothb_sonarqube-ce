@@ -27,19 +27,23 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@actions/core": "^3.0.1"
+    "@actions/artifact": "^6.2.1",
+    "@actions/cache": "^6.2.0",
+    "@actions/core": "^3.0.1",
+    "@actions/github": "^9.1.1"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.5",
     "@github/local-action": "^7.0.1",
     "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-node-resolve": "^16.0.3",
     "@rollup/plugin-typescript": "^12.3.0",
     "@types/node": "^26.1.1",
-    "@vitest/coverage-v8": "^3.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
     "rollup": "^4.62.2",
     "tslib": "^2.8.1",
     "typescript": "^6.0.3",
-    "vitest": "^3.1.1"
+    "vitest": "^4.1.10"
   }
 }
