@@ -211,10 +211,153 @@ async function postPrComment(summary: string, token: string): Promise<void> {
 
 // ── Main orchestration ───────────────────────────────────────────────
 
+// Shared between the `main` and `post` phases — both must target the same
+// server instance, port, and credentials.
+const NETWORK_NAME = "sq-network";
+const CONTAINER_NAME = "sonar-server";
+const SQ_PORT = "9234";
+const ADMIN_PASSWORD = "Son@rless123";
+
+/**
+ * Restore the Docker images from cache or pull them. Returns true on a cache
+ * hit (callers skip their own cache-save on a miss).
+ */
+async function pullImages(
+  inputs: ActionInputs,
+  includeScanner: boolean,
+): Promise<boolean> {
+  core.debug("Checking Docker image cache …");
+  const cacheHit = await restoreDockerCache(
+    inputs.sonarServerImage,
+    includeScanner ? inputs.sonarScannerImage : undefined,
+  );
+
+  if (cacheHit) {
+    core.info("Docker image cache hit — skipping pull.");
+    return true;
+  }
+
+  core.info(`Pulling ${inputs.sonarServerImage} …`);
+  await dockerPull(inputs.sonarServerImage);
+  if (includeScanner) {
+    core.debug(`Pulling ${inputs.sonarScannerImage} …`);
+    await dockerPull(inputs.sonarScannerImage);
+  }
+  return false;
+}
+
+/** Finalize after a scan: quality gate, metrics, reports, summary, PR comment. */
+async function finalize(
+  sq: SonarQube,
+  inputs: ActionInputs,
+  projectKey: string,
+  containerName: string,
+): Promise<void> {
+  // ── Quality gate ──────────────────────────────────────────────
+  core.info("Waiting for quality gate (timeout: 120s) …");
+  await sq.waitForQualityGate(projectKey, 120);
+  const qg = await sq.projectStatus(projectKey);
+  core.info(`Quality gate: ${qg.projectStatus.status}`);
+
+  // ── Metrics ───────────────────────────────────────────────────
+  const metricKeys = [
+    "bugs",
+    "vulnerabilities",
+    "code_smells",
+    "quality_gate_details",
+    "violations",
+    "duplicated_lines_density",
+    "ncloc",
+    "coverage",
+    "reliability_rating",
+    "security_rating",
+    "security_review_rating",
+    "sqale_rating",
+    "security_hotspots",
+    "open_issues",
+    "alert_status",
+  ];
+  core.debug("Fetching metrics …");
+  const metrics = await sq.measures(projectKey, metricKeys);
+  const metricsPath = "./sonar-metrics.json";
+  await writeFile(metricsPath, JSON.stringify(metrics, null, 2));
+  core.info(`Metrics written to ${metricsPath}`);
+
+  // ── Reports ───────────────────────────────────────────────────
+  const { newIssues, newHotspots, newArtifactUrl, overallArtifactUrl } =
+    await generateReports(sq, inputs, projectKey, containerName);
+
+  // ── Step summary ──────────────────────────────────────────────
+  const summary = generateAnalysisSummary({
+    metrics,
+    newIssues,
+    newHotspots,
+    newArtifactUrl,
+    overallArtifactUrl,
+  });
+  core.summary.addRaw(summary);
+  await core.summary.write();
+  core.setOutput("analysis-summary", summary);
+  core.info("Step summary written.");
+
+  // ── PR comment ───────────────────────────────────────────────
+  if (inputs.generatePrComment) {
+    await postPrComment(summary, inputs.githubToken);
+  }
+}
+
+/** Tear down the SonarQube container and Docker network (best-effort). */
+async function cleanup(
+  containerName: string,
+  networkName: string,
+): Promise<void> {
+  core.info(`Stopping ${containerName} …`);
+  await dockerStop(containerName).catch(() => {});
+  await dockerRm(containerName).catch(() => {});
+  core.debug(`Removing network ${networkName} …`);
+  await dockerNetworkRm(networkName).catch(() => {});
+  core.info("Cleanup complete.");
+}
+
+/** Detect whether the action is running in its `post:` phase. */
+export function currentPhase(): "main" | "post" {
+  return core.getState("isPost") === "true" ? "post" : "main";
+}
+
+/**
+ * Entry point for the `post:` phase. Reads saved state and finalizes the scan.
+ * No-op when no state was saved (e.g. `scan-mode: cli` already finalized
+ * inline).
+ */
+export async function runPost(): Promise<void> {
+  const projectKey = core.getState("projectKey");
+  if (!projectKey) {
+    return; // Nothing to finalize — `scan-mode: cli` already finalized inline.
+  }
+
+  try {
+    const inputs = parseInputs();
+    const sq = new SonarQube(`http://localhost:${SQ_PORT}`, {
+      user: "admin",
+      pass: ADMIN_PASSWORD,
+    });
+
+    core.info("Finalizing scan …");
+    await finalize(sq, inputs, projectKey, CONTAINER_NAME);
+  } catch (error) {
+    if (error instanceof Error) {
+      core.setFailed(error.message);
+    }
+  } finally {
+    await cleanup(CONTAINER_NAME, NETWORK_NAME);
+  }
+}
+
 export async function run(): Promise<void> {
-  const networkName = "sq-network";
-  const containerName = "sonar-server";
   const tokenName = `scan-${Date.now()}`;
+  // When true (scan-mode: none reached the handoff point), the server must
+  // stay up for later steps, so cleanup is skipped.
+  let keepServer = false;
 
   try {
     const inputs = parseInputs();
@@ -224,35 +367,33 @@ export async function run(): Promise<void> {
     }
 
     // ── Docker setup ──────────────────────────────────────────────
-    core.debug("Checking Docker image cache …");
-    const cacheHit = await restoreDockerCache(
-      inputs.sonarServerImage,
-      inputs.sonarScannerImage,
-    );
+    const isNone = inputs.scanMode === "none";
+    const cacheHit = await pullImages(inputs, !isNone);
 
-    if (cacheHit) {
-      core.info("Docker image cache hit — skipping pull.");
-    } else {
-      core.info(`Pulling ${inputs.sonarServerImage} …`);
-      await dockerPull(inputs.sonarServerImage);
-      core.debug(`Pulling ${inputs.sonarScannerImage} …`);
-      await dockerPull(inputs.sonarScannerImage);
+    // In server-only mode, cache the server image immediately: no scan
+    // follows, and the CLI-mode cache save at the end is skipped by the
+    // early return.
+    if (isNone && !cacheHit) {
+      core.debug("Saving Docker images to cache …");
+      await saveDockerCache(inputs.sonarServerImage).catch((err) =>
+        core.warning(`Cache save failed: ${err}`),
+      );
+      core.debug("Cache saved.");
     }
 
-    core.debug(`Creating network ${networkName} …`);
-    await dockerNetworkCreate(networkName);
+    core.debug(`Creating network ${NETWORK_NAME} …`);
+    await dockerNetworkCreate(NETWORK_NAME);
 
-    const sqPort = "9234";
-    core.debug(`Starting SonarQube on port ${sqPort} …`);
+    core.debug(`Starting SonarQube on port ${SQ_PORT} …`);
     await dockerRun({
       image: inputs.sonarServerImage,
-      name: containerName,
-      port: `${sqPort}:9000`,
-      network: networkName,
+      name: CONTAINER_NAME,
+      port: `${SQ_PORT}:9000`,
+      network: NETWORK_NAME,
     });
 
     // ── SonarQube bootstrap ───────────────────────────────────────
-    const baseUrl = `http://localhost:${sqPort}`;
+    const baseUrl = `http://localhost:${SQ_PORT}`;
     const sq = new SonarQube(baseUrl, { user: "admin", pass: "admin" });
 
     core.info("Waiting for SonarQube to boot (timeout: 180s) …");
@@ -260,9 +401,8 @@ export async function run(): Promise<void> {
     core.info("SonarQube is UP.");
 
     core.debug("Changing default password …");
-    const newPassword = "Son@rless123";
-    await sq.changePassword(newPassword);
-    sq.setAuth({ user: "admin", pass: newPassword });
+    await sq.changePassword(ADMIN_PASSWORD);
+    sq.setAuth({ user: "admin", pass: ADMIN_PASSWORD });
 
     // ── Project + Token ───────────────────────────────────────────
     const projectKey = inputs.sonarProjectName.replace(
@@ -279,15 +419,34 @@ export async function run(): Promise<void> {
     const token = await sq.generateToken(tokenName);
     core.debug(`Token: ${token.slice(0, 8)}…`);
 
+    // ── Expose connection outputs (always) ────────────────────────
+    core.setSecret(token);
+    core.setOutput("sonar-host-url", baseUrl);
+    core.setOutput("sonar-project-key", projectKey);
+    core.setOutput("sonar-token", token);
+
+    // ── Server-only mode: hand off scanning to later steps ────────
+    if (inputs.scanMode === "none") {
+      if (inputs.sonarSourcePath !== ".") {
+        core.warning(
+          "sonar-source-path is ignored when scan-mode is none: the .NET scanner analyzes what the build compiles.",
+        );
+      }
+      core.saveState("projectKey", projectKey);
+      core.saveState("token", token);
+      keepServer = true;
+      return;
+    }
+
     // ── Scanner ───────────────────────────────────────────────────
     const workspace = process.env.GITHUB_WORKSPACE ?? ".";
     core.info("Running scanner …");
     await dockerRun({
       image: inputs.sonarScannerImage,
       rm: true,
-      network: networkName,
+      network: NETWORK_NAME,
       env: {
-        SONAR_HOST_URL: `http://${containerName}:9000`,
+        SONAR_HOST_URL: `http://${CONTAINER_NAME}:9000`,
         SONAR_TOKEN: token,
         SONAR_SCANNER_OPTS: [
           `-Dsonar.projectKey=${projectKey}`,
@@ -301,57 +460,8 @@ export async function run(): Promise<void> {
     });
     core.info("Scanner finished.");
 
-    // ── Quality gate ──────────────────────────────────────────────
-    core.info("Waiting for quality gate (timeout: 120s) …");
-    await sq.waitForQualityGate(projectKey, 120);
-    const qg = await sq.projectStatus(projectKey);
-    core.info(`Quality gate: ${qg.projectStatus.status}`);
-
-    // ── Metrics ───────────────────────────────────────────────────
-    const metricKeys = [
-      "bugs",
-      "vulnerabilities",
-      "code_smells",
-      "quality_gate_details",
-      "violations",
-      "duplicated_lines_density",
-      "ncloc",
-      "coverage",
-      "reliability_rating",
-      "security_rating",
-      "security_review_rating",
-      "sqale_rating",
-      "security_hotspots",
-      "open_issues",
-      "alert_status",
-    ];
-    core.debug("Fetching metrics …");
-    const metrics = await sq.measures(projectKey, metricKeys);
-    const metricsPath = "./sonar-metrics.json";
-    await writeFile(metricsPath, JSON.stringify(metrics, null, 2));
-    core.info(`Metrics written to ${metricsPath}`);
-
-    // ── Reports ───────────────────────────────────────────────────
-    const { newIssues, newHotspots, newArtifactUrl, overallArtifactUrl } =
-      await generateReports(sq, inputs, projectKey, containerName);
-
-    // ── Step summary ──────────────────────────────────────────────
-    const summary = generateAnalysisSummary({
-      metrics,
-      newIssues,
-      newHotspots,
-      newArtifactUrl,
-      overallArtifactUrl,
-    });
-    core.summary.addRaw(summary);
-    await core.summary.write();
-    core.setOutput("analysis-summary", summary);
-    core.info("Step summary written.");
-
-    // ── PR comment ───────────────────────────────────────────────
-    if (inputs.generatePrComment) {
-      await postPrComment(summary, inputs.githubToken);
-    }
+    // ── Finalize ──────────────────────────────────────────────────
+    await finalize(sq, inputs, projectKey, CONTAINER_NAME);
 
     // ── Cache save (only if cache miss) ────────────────────────────
     if (!cacheHit) {
@@ -367,12 +477,8 @@ export async function run(): Promise<void> {
       core.setFailed(error.message);
     }
   } finally {
-    // ── Cleanup ───────────────────────────────────────────────────
-    core.info(`Stopping ${containerName} …`);
-    await dockerStop(containerName).catch(() => {});
-    await dockerRm(containerName).catch(() => {});
-    core.debug(`Removing network ${networkName} …`);
-    await dockerNetworkRm(networkName).catch(() => {});
-    core.info("Cleanup complete.");
+    if (!keepServer) {
+      await cleanup(CONTAINER_NAME, NETWORK_NAME);
+    }
   }
 }

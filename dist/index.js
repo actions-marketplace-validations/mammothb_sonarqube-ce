@@ -1,6 +1,3 @@
-import { exec as exec$1 } from 'node:child_process';
-import fs$1, { mkdirSync, existsSync as existsSync$1 } from 'node:fs';
-import require$$5$5, { writeFile as writeFile$1, mkdir as mkdir$1 } from 'node:fs/promises';
 import * as os from 'os';
 import os__default, { EOL as EOL$1 } from 'os';
 import * as crypto from 'crypto';
@@ -40,6 +37,9 @@ import require$$1$5 from 'node:dns';
 import require$$5$3 from 'string_decoder';
 import * as child from 'child_process';
 import { setTimeout as setTimeout$1 } from 'timers';
+import { exec as exec$1 } from 'node:child_process';
+import fs$1, { mkdirSync, existsSync as existsSync$1 } from 'node:fs';
+import require$$5$5, { writeFile as writeFile$1, mkdir as mkdir$1 } from 'node:fs/promises';
 import * as require$$0$3 from 'stream';
 import require$$0__default$1, { Readable } from 'stream';
 import { createRequire } from 'node:module';
@@ -30213,6 +30213,32 @@ function warning(message, properties = {}) {
  */
 function info(message) {
     process.stdout.write(message + os.EOL);
+}
+//-----------------------------------------------------------------------
+// Wrapper action state
+//-----------------------------------------------------------------------
+/**
+ * Saves state for current action, the state can only be retrieved by this action's post job execution.
+ *
+ * @param     name     name of the state to store
+ * @param     value    value to store. Non-string values will be converted to a string via JSON.stringify
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function saveState(name, value) {
+    const filePath = process.env['GITHUB_STATE'] || '';
+    if (filePath) {
+        return issueFileCommand('STATE', prepareKeyValueMessage(name, value));
+    }
+    issueCommand('save-state', { name }, toCommandValue(value));
+}
+/**
+ * Gets the value of an state set by this action's main execution.
+ *
+ * @param     name     name of the state to get
+ * @returns   string
+ */
+function getState(name) {
+    return process.env[`STATE_${name}`] || '';
 }
 
 // Used for controlling the highWaterMark value of the zip that is being streamed
@@ -162279,9 +162305,12 @@ const CACHE_DIR = "/tmp/docker-cache"; // NOSONAR — standard temp dir for Dock
 function ensureCacheDir() {
     mkdirSync(CACHE_DIR, { recursive: true });
 }
-/** Build cache key from image versions */
+/** Build cache key from image versions (scanner image optional). */
 function cacheKey(serverImage, scannerImage) {
     const sv = serverImage.replace(/[/:]/g, "-");
+    if (scannerImage === undefined) {
+        return `sq-docker-${sv}`;
+    }
     const sc = scannerImage.replace(/[/:]/g, "-");
     return `sq-docker-${sv}-${sc}`;
 }
@@ -162294,7 +162323,9 @@ async function restoreDockerCache(serverImage, scannerImage) {
     const hit = await restoreCache([CACHE_DIR], key);
     if (hit) {
         await dockerLoad(`${CACHE_DIR}/server.tar`);
-        await dockerLoad(`${CACHE_DIR}/scanner.tar`);
+        if (scannerImage !== undefined) {
+            await dockerLoad(`${CACHE_DIR}/scanner.tar`);
+        }
     }
     return hit !== undefined;
 }
@@ -162305,7 +162336,9 @@ async function saveDockerCache(serverImage, scannerImage) {
     ensureCacheDir();
     const key = cacheKey(serverImage, scannerImage);
     await dockerSave(serverImage, `${CACHE_DIR}/server.tar`);
-    await dockerSave(scannerImage, `${CACHE_DIR}/scanner.tar`);
+    if (scannerImage !== undefined) {
+        await dockerSave(scannerImage, `${CACHE_DIR}/scanner.tar`);
+    }
     await saveCache([CACHE_DIR], key);
 }
 
@@ -162316,6 +162349,7 @@ function parseInputs() {
     const sonarSourcePath = getInput("sonar-source-path");
     const sonarServerImage = getInput("sonar-server-image");
     const sonarScannerImage = getInput("sonar-scanner-image");
+    const scanModeRaw = getInput("scan-mode") || "cli";
     const sonarOptions = getInput("sonar-options");
     const preScanScript = getInput("pre-scan-script");
     const githubToken = getInput("github-token") || process.env.GITHUB_TOKEN || "";
@@ -162327,6 +162361,11 @@ function parseInputs() {
     if (!sonarServerImage.includes("community")) {
         throw new Error(`sonar-server-image must be a Community Edition image (must contain "community"), got: "${sonarServerImage}"`);
     }
+    // ── Validate scan mode ───────────────────────────────────────────────
+    if (scanModeRaw !== "cli" && scanModeRaw !== "none") {
+        throw new Error(`scan-mode must be "cli" or "none", got: "${scanModeRaw}"`);
+    }
+    const scanMode = scanModeRaw;
     // ── Parse reports scopes ───────────────────────────────────────────
     let reportsScopes;
     try {
@@ -162357,6 +162396,7 @@ function parseInputs() {
         sonarSourcePath,
         sonarServerImage,
         sonarScannerImage,
+        scanMode,
         sonarOptions,
         preScanScript,
         githubToken,
@@ -163065,47 +163105,160 @@ async function postPrComment(summary, token) {
     }
 }
 // ── Main orchestration ───────────────────────────────────────────────
+// Shared between the `main` and `post` phases — both must target the same
+// server instance, port, and credentials.
+const NETWORK_NAME = "sq-network";
+const CONTAINER_NAME = "sonar-server";
+const SQ_PORT = "9234";
+const ADMIN_PASSWORD = "Son@rless123";
+/**
+ * Restore the Docker images from cache or pull them. Returns true on a cache
+ * hit (callers skip their own cache-save on a miss).
+ */
+async function pullImages(inputs, includeScanner) {
+    debug("Checking Docker image cache …");
+    const cacheHit = await restoreDockerCache(inputs.sonarServerImage, includeScanner ? inputs.sonarScannerImage : undefined);
+    if (cacheHit) {
+        info("Docker image cache hit — skipping pull.");
+        return true;
+    }
+    info(`Pulling ${inputs.sonarServerImage} …`);
+    await dockerPull(inputs.sonarServerImage);
+    if (includeScanner) {
+        debug(`Pulling ${inputs.sonarScannerImage} …`);
+        await dockerPull(inputs.sonarScannerImage);
+    }
+    return false;
+}
+/** Finalize after a scan: quality gate, metrics, reports, summary, PR comment. */
+async function finalize(sq, inputs, projectKey, containerName) {
+    // ── Quality gate ──────────────────────────────────────────────
+    info("Waiting for quality gate (timeout: 120s) …");
+    await sq.waitForQualityGate(projectKey, 120);
+    const qg = await sq.projectStatus(projectKey);
+    info(`Quality gate: ${qg.projectStatus.status}`);
+    // ── Metrics ───────────────────────────────────────────────────
+    const metricKeys = [
+        "bugs",
+        "vulnerabilities",
+        "code_smells",
+        "quality_gate_details",
+        "violations",
+        "duplicated_lines_density",
+        "ncloc",
+        "coverage",
+        "reliability_rating",
+        "security_rating",
+        "security_review_rating",
+        "sqale_rating",
+        "security_hotspots",
+        "open_issues",
+        "alert_status",
+    ];
+    debug("Fetching metrics …");
+    const metrics = await sq.measures(projectKey, metricKeys);
+    const metricsPath = "./sonar-metrics.json";
+    await writeFile$1(metricsPath, JSON.stringify(metrics, null, 2));
+    info(`Metrics written to ${metricsPath}`);
+    // ── Reports ───────────────────────────────────────────────────
+    const { newIssues, newHotspots, newArtifactUrl, overallArtifactUrl } = await generateReports(sq, inputs, projectKey, containerName);
+    // ── Step summary ──────────────────────────────────────────────
+    const summary$1 = generateAnalysisSummary({
+        metrics,
+        newIssues,
+        newHotspots,
+        newArtifactUrl,
+        overallArtifactUrl,
+    });
+    summary.addRaw(summary$1);
+    await summary.write();
+    setOutput("analysis-summary", summary$1);
+    info("Step summary written.");
+    // ── PR comment ───────────────────────────────────────────────
+    if (inputs.generatePrComment) {
+        await postPrComment(summary$1, inputs.githubToken);
+    }
+}
+/** Tear down the SonarQube container and Docker network (best-effort). */
+async function cleanup(containerName, networkName) {
+    info(`Stopping ${containerName} …`);
+    await dockerStop(containerName).catch(() => { });
+    await dockerRm(containerName).catch(() => { });
+    debug(`Removing network ${networkName} …`);
+    await dockerNetworkRm(networkName).catch(() => { });
+    info("Cleanup complete.");
+}
+/** Detect whether the action is running in its `post:` phase. */
+function currentPhase() {
+    return getState("isPost") === "true" ? "post" : "main";
+}
+/**
+ * Entry point for the `post:` phase. Reads saved state and finalizes the scan.
+ * No-op when no state was saved (e.g. `scan-mode: cli` already finalized
+ * inline).
+ */
+async function runPost() {
+    const projectKey = getState("projectKey");
+    if (!projectKey) {
+        return; // Nothing to finalize — `scan-mode: cli` already finalized inline.
+    }
+    try {
+        const inputs = parseInputs();
+        const sq = new SonarQube(`http://localhost:${SQ_PORT}`, {
+            user: "admin",
+            pass: ADMIN_PASSWORD,
+        });
+        info("Finalizing scan …");
+        await finalize(sq, inputs, projectKey, CONTAINER_NAME);
+    }
+    catch (error) {
+        if (error instanceof Error) {
+            setFailed(error.message);
+        }
+    }
+    finally {
+        await cleanup(CONTAINER_NAME, NETWORK_NAME);
+    }
+}
 async function run() {
-    const networkName = "sq-network";
-    const containerName = "sonar-server";
     const tokenName = `scan-${Date.now()}`;
+    // When true (scan-mode: none reached the handoff point), the server must
+    // stay up for later steps, so cleanup is skipped.
+    let keepServer = false;
     try {
         const inputs = parseInputs();
         if (inputs.preScanScript) {
             await execPreScanScript(inputs.preScanScript);
         }
         // ── Docker setup ──────────────────────────────────────────────
-        debug("Checking Docker image cache …");
-        const cacheHit = await restoreDockerCache(inputs.sonarServerImage, inputs.sonarScannerImage);
-        if (cacheHit) {
-            info("Docker image cache hit — skipping pull.");
+        const isNone = inputs.scanMode === "none";
+        const cacheHit = await pullImages(inputs, !isNone);
+        // In server-only mode, cache the server image immediately: no scan
+        // follows, and the CLI-mode cache save at the end is skipped by the
+        // early return.
+        if (isNone && !cacheHit) {
+            debug("Saving Docker images to cache …");
+            await saveDockerCache(inputs.sonarServerImage).catch((err) => warning(`Cache save failed: ${err}`));
+            debug("Cache saved.");
         }
-        else {
-            info(`Pulling ${inputs.sonarServerImage} …`);
-            await dockerPull(inputs.sonarServerImage);
-            debug(`Pulling ${inputs.sonarScannerImage} …`);
-            await dockerPull(inputs.sonarScannerImage);
-        }
-        debug(`Creating network ${networkName} …`);
-        await dockerNetworkCreate(networkName);
-        const sqPort = "9234";
-        debug(`Starting SonarQube on port ${sqPort} …`);
+        debug(`Creating network ${NETWORK_NAME} …`);
+        await dockerNetworkCreate(NETWORK_NAME);
+        debug(`Starting SonarQube on port ${SQ_PORT} …`);
         await dockerRun({
             image: inputs.sonarServerImage,
-            name: containerName,
-            port: `${sqPort}:9000`,
-            network: networkName,
+            name: CONTAINER_NAME,
+            port: `${SQ_PORT}:9000`,
+            network: NETWORK_NAME,
         });
         // ── SonarQube bootstrap ───────────────────────────────────────
-        const baseUrl = `http://localhost:${sqPort}`;
+        const baseUrl = `http://localhost:${SQ_PORT}`;
         const sq = new SonarQube(baseUrl, { user: "admin", pass: "admin" });
         info("Waiting for SonarQube to boot (timeout: 180s) …");
         await sq.waitForUp(180);
         info("SonarQube is UP.");
         debug("Changing default password …");
-        const newPassword = "Son@rless123";
-        await sq.changePassword(newPassword);
-        sq.setAuth({ user: "admin", pass: newPassword });
+        await sq.changePassword(ADMIN_PASSWORD);
+        sq.setAuth({ user: "admin", pass: ADMIN_PASSWORD });
         // ── Project + Token ───────────────────────────────────────────
         const projectKey = inputs.sonarProjectName.replace(/[^a-zA-Z0-9._:-]+/g, "-");
         debug(`Creating project "${inputs.sonarProjectName}" (key: ${projectKey}) …`);
@@ -163114,15 +163267,30 @@ async function run() {
         debug("Generating user token …");
         const token = await sq.generateToken(tokenName);
         debug(`Token: ${token.slice(0, 8)}…`);
+        // ── Expose connection outputs (always) ────────────────────────
+        setSecret(token);
+        setOutput("sonar-host-url", baseUrl);
+        setOutput("sonar-project-key", projectKey);
+        setOutput("sonar-token", token);
+        // ── Server-only mode: hand off scanning to later steps ────────
+        if (inputs.scanMode === "none") {
+            if (inputs.sonarSourcePath !== ".") {
+                warning("sonar-source-path is ignored when scan-mode is none: the .NET scanner analyzes what the build compiles.");
+            }
+            saveState("projectKey", projectKey);
+            saveState("token", token);
+            keepServer = true;
+            return;
+        }
         // ── Scanner ───────────────────────────────────────────────────
         const workspace = process.env.GITHUB_WORKSPACE ?? ".";
         info("Running scanner …");
         await dockerRun({
             image: inputs.sonarScannerImage,
             rm: true,
-            network: networkName,
+            network: NETWORK_NAME,
             env: {
-                SONAR_HOST_URL: `http://${containerName}:9000`,
+                SONAR_HOST_URL: `http://${CONTAINER_NAME}:9000`,
                 SONAR_TOKEN: token,
                 SONAR_SCANNER_OPTS: [
                     `-Dsonar.projectKey=${projectKey}`,
@@ -163135,52 +163303,8 @@ async function run() {
             volume: `${workspace}:/usr/src`,
         });
         info("Scanner finished.");
-        // ── Quality gate ──────────────────────────────────────────────
-        info("Waiting for quality gate (timeout: 120s) …");
-        await sq.waitForQualityGate(projectKey, 120);
-        const qg = await sq.projectStatus(projectKey);
-        info(`Quality gate: ${qg.projectStatus.status}`);
-        // ── Metrics ───────────────────────────────────────────────────
-        const metricKeys = [
-            "bugs",
-            "vulnerabilities",
-            "code_smells",
-            "quality_gate_details",
-            "violations",
-            "duplicated_lines_density",
-            "ncloc",
-            "coverage",
-            "reliability_rating",
-            "security_rating",
-            "security_review_rating",
-            "sqale_rating",
-            "security_hotspots",
-            "open_issues",
-            "alert_status",
-        ];
-        debug("Fetching metrics …");
-        const metrics = await sq.measures(projectKey, metricKeys);
-        const metricsPath = "./sonar-metrics.json";
-        await writeFile$1(metricsPath, JSON.stringify(metrics, null, 2));
-        info(`Metrics written to ${metricsPath}`);
-        // ── Reports ───────────────────────────────────────────────────
-        const { newIssues, newHotspots, newArtifactUrl, overallArtifactUrl } = await generateReports(sq, inputs, projectKey, containerName);
-        // ── Step summary ──────────────────────────────────────────────
-        const summary$1 = generateAnalysisSummary({
-            metrics,
-            newIssues,
-            newHotspots,
-            newArtifactUrl,
-            overallArtifactUrl,
-        });
-        summary.addRaw(summary$1);
-        await summary.write();
-        setOutput("analysis-summary", summary$1);
-        info("Step summary written.");
-        // ── PR comment ───────────────────────────────────────────────
-        if (inputs.generatePrComment) {
-            await postPrComment(summary$1, inputs.githubToken);
-        }
+        // ── Finalize ──────────────────────────────────────────────────
+        await finalize(sq, inputs, projectKey, CONTAINER_NAME);
         // ── Cache save (only if cache miss) ────────────────────────────
         if (!cacheHit) {
             debug("Saving Docker images to cache …");
@@ -163194,20 +163318,22 @@ async function run() {
         }
     }
     finally {
-        // ── Cleanup ───────────────────────────────────────────────────
-        info(`Stopping ${containerName} …`);
-        await dockerStop(containerName).catch(() => { });
-        await dockerRm(containerName).catch(() => { });
-        debug(`Removing network ${networkName} …`);
-        await dockerNetworkRm(networkName).catch(() => { });
-        info("Cleanup complete.");
+        if (!keepServer) {
+            await cleanup(CONTAINER_NAME, NETWORK_NAME);
+        }
     }
 }
 
 /**
- * The entrypoint for the action. This file simply imports and runs the action's
- * main logic.
+ * The entrypoint for the action. Dispatches to the `main` or `post` phase:
+ * `main` runs the scan; `post` (declared in action.yml) finalizes + cleans up.
  */
 /* istanbul ignore next */
-run();
+if (currentPhase() === "post") {
+    runPost();
+}
+else {
+    saveState("isPost", "true");
+    run();
+}
 //# sourceMappingURL=index.js.map
